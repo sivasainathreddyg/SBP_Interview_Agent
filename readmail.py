@@ -1,14 +1,91 @@
 import os.path
+import re
 import base64
+from io import BytesIO
 from pypdf import PdfReader
+
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+from dbConnection import connection
+
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
+
+# ---------- PDF helpers ----------
+
+def extract_text_from_pdf_bytes(pdf_bytes):
+    reader = PdfReader(BytesIO(pdf_bytes))
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text() or ""
+    return text
+
+
+def extract_name_email(text):
+    email_match = re.search(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", text)
+    email = email_match.group() if email_match else None
+
+    first_line = text.strip().split("\n")[0][:50] if text else None
+    name = first_line
+
+    return name, email
+
+
+# ---------- DB helpers ----------
+
+def insert_cv_into_hana(conn, mail_id, name, email, attachment_bytes, status="NEW"):
+    cursor = conn.cursor()
+    sql = """
+    INSERT INTO CV_Info (ID, NAME, EMAIL, ATTACHMENT, STATUS)
+    VALUES (?, ?, ?, ?, ?)
+    """
+    cursor.execute(sql, (mail_id, name, email, attachment_bytes, status))
+    conn.commit()
+
+
+# ---------- Attachment processing ----------
+
+def process_and_store_pdf(service, conn, msg_id, payload):
+    if "parts" not in payload:
+        return
+
+    for part in payload["parts"]:
+        filename = part.get("filename")
+        body = part.get("body", {})
+
+        if filename and filename.lower().endswith(".pdf") and "attachmentId" in body:
+            att_id = body["attachmentId"]
+
+            att = service.users().messages().attachments().get(
+                userId="me",
+                messageId=msg_id,
+                id=att_id
+            ).execute()
+
+            pdf_bytes = base64.urlsafe_b64decode(att["data"])
+            text = extract_text_from_pdf_bytes(pdf_bytes)
+            name, email = extract_name_email(text)
+
+            try:
+                insert_cv_into_hana(
+                    conn,
+                    mail_id=email,
+                    name=name,
+                    email=email,
+                    attachment_bytes=pdf_bytes,
+                    status="NEW"
+                )
+                print(f"Stored CV from mail {msg_id}")
+
+            except Exception as e:
+                print(f"Could not insert {msg_id}: {e}")
+
+
+# ---------- Gmail helpers ----------
 
 def get_body(payload):
     if "parts" in payload:
@@ -19,61 +96,16 @@ def get_body(payload):
         return base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8", errors="ignore")
     return ""
 
-def save_attachments(service, msg_id, payload, save_dir="attachments"):
-    import os
 
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
-
-    if "parts" not in payload:
-        return
-
-    for part in payload["parts"]:
-        filename = part.get("filename")
-        body = part.get("body", {})
-
-        if filename and "attachmentId" in body:
-            att_id = body["attachmentId"]
-
-            att = service.users().messages().attachments().get(
-                userId="me",
-                messageId=msg_id,
-                id=att_id
-            ).execute()
-
-            data = att["data"]
-            file_data = base64.urlsafe_b64decode(data)
-
-            path = os.path.join(save_dir, filename)
-            with open(path, "wb") as f:
-                f.write(file_data)
-
-            print(f"Saved attachment: {path}")
-
-            # If it's a PDF, extract text
-            # if filename.lower().endswith(".pdf"):
-            #     text = extract_text_from_pdf(path)
-            #     print(f"Extracted text from {filename}:\n{text[:1000]}")
-
-
-
-
-def extract_text_from_pdf(file_path):
-    reader = PdfReader(file_path)
-    text = ""
-    for page in reader.pages:
-        text += page.extract_text() or ""
-    return text
-
+# ---------- Main ----------
 
 def main():
     creds = None
+    conn = connection.get_connection()
 
-    # Load token if exists
     if os.path.exists("token.json"):
         creds = Credentials.from_authorized_user_file("token.json", SCOPES)
 
-    # Login if needed
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
@@ -97,10 +129,9 @@ def main():
         messages = results.get("messages", [])
 
         if not messages:
-            print("No messages found in INBOX.")
+            print("No matching emails found.")
+            conn.close()
             return
-
-        print("\nLatest emails in INBOX:\n")
 
         for msg in messages:
             msg_id = msg["id"]
@@ -117,23 +148,20 @@ def main():
                 if h["name"] == "From":
                     from_ = h["value"]
 
-            snippet = msg_data.get("snippet", "")
-            body = get_body(msg_data["payload"])
-
-            print(f"From   : {from_}")
+            print(f"\nFrom   : {from_}")
             print(f"Subject: {subject}")
-            print(f"Snippet: {snippet}")
 
-            save_attachments(service, msg_id, msg_data["payload"])
-
+            process_and_store_pdf(service, conn, msg_id, msg_data["payload"])
             print("-" * 60)
-
 
     except HttpError as error:
         print(f"An error occurred: {error}")
+
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":
     main()
 
-    # new
+#nenen
