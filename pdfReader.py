@@ -14,4 +14,3 @@ def read_cv(pdf_path):
 cv_text = read_cv(r"C:\Users\BPSH147\Downloads\samplePdf1.pdf")
 print(cv_text)
 
-
